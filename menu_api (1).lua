@@ -95,8 +95,6 @@ function Library:CreateWindow(env)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then return "MouseButton1" end
 		if input.UserInputType == Enum.UserInputType.MouseButton2 then return "MouseButton2" end
 		if input.UserInputType == Enum.UserInputType.MouseButton3 then return "MouseButton3" end
-		if input.UserInputType == Enum.UserInputType.MouseButton4 then return "MouseButton4" end
-		if input.UserInputType == Enum.UserInputType.MouseButton5 then return "MouseButton5" end
 		return nil
 	end
 

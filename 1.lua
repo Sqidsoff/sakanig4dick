@@ -62,6 +62,9 @@ local cfg = {
 	AimUseNearestVisibleHitbox = false,
 	AimMultiPointEnabled = true,
 	AimMultiPointScale = 0.42, -- 0..1, offsets from hitbox center
+	AimPredictionEnabled = true,
+	AimPredictionTime = 0.12,
+	AimTrackingSmoothness = 65,
 	SilentAim1Enabled = false,
 	SilentAim1AutoMouse1 = false,
 	SilentAim1AutoMouse1Interval = 0.06,
@@ -87,6 +90,27 @@ local cfg = {
 	TriggerbotEnabled = false,
 	TriggerbotRadius = 18,
 	VerticalFreezeEnabled = false,
+	GrappleEnabled = false,
+	GrappleRange = 650,
+	GrapplePull = 115,
+	GrappleMaxSpeed = 150,
+	WallRunEnabled = false,
+	WallRunSpeed = 62,
+	WallRunLift = 8,
+	CeilingWalkEnabled = false,
+	CeilingWalkSpeed = 34,
+	CeilingWalkGravity = 85,
+	TelekinesisEnabled = false,
+	TelekinesisDistance = 18,
+	TelekinesisPower = 145,
+	TelekinesisMaxMass = 250,
+	PhysicsTornadoEnabled = false,
+	PhysicsTornadoRadius = 32,
+	PhysicsTornadoForce = 95,
+	PhysicsTornadoMaxParts = 24,
+	SurfaceSurferEnabled = false,
+	SurfaceSurferSpeed = 72,
+	SurfaceSurferAcceleration = 85,
 	TiltEnabled = false,
 	TiltYaw = 0,
 	TiltPitch = 0,
@@ -201,6 +225,8 @@ local stickyTargetPart: BasePart? = nil
 local stickyTargetUntil = 0
 local STICKY_TARGET_GRACE = 0.45
 local STICKY_FOV_MULTIPLIER = 1.30
+local aimFilteredPart: BasePart? = nil
+local aimFilteredPoint: Vector3? = nil
 local recordShotCandidate: (() -> ())? = nil
 local setProjectileRedirectEnabled: ((boolean) -> ())? = nil
 local pendingShots: {[Humanoid]: {health: number, expires: number, part: BasePart?, player: Player?}} = {}
@@ -213,6 +239,31 @@ local Phantom = {
 	checked = false,
 	lastTry = 0,
 	scanAcc = 0,
+}
+local Motion = {
+	grappleHeld = false,
+	grapplePoint = nil,
+	grappleAnchor = nil,
+	grappleBeam = nil,
+	grappleRootAttachment = nil,
+	ceilingActive = false,
+	ceilingNormal = Vector3.yAxis,
+	ceilingAttachment = nil,
+	ceilingForce = nil,
+	ceilingOrientation = nil,
+	telePart = nil,
+	teleTarget = nil,
+	telePartAttachment = nil,
+	teleTargetAttachment = nil,
+	telePosition = nil,
+	teleOrientation = nil,
+	tornadoActive = false,
+	tornadoParts = {},
+	tornadoScanAcc = 0,
+	tornadoAngle = 0,
+	silentNamecallHook = false,
+	silentIndexHook = false,
+	silentDirectRayHook = false,
 }
 local projectileCandidates = setmetatable({}, {__mode = "k"})
 local projectileAddedSubscription: any = nil
@@ -232,6 +283,7 @@ local lastProfileToolName = ""
 local antiAfkConn: RBXScriptConnection? = nil
 local visualTickAcc = 0
 local visualDynamicCursor: Player? = nil
+local lastFOVViewportSize = Vector2.zero
 local worldTickAcc = 0
 local noclipTickAcc = 0
 local autoPeekStartCF = nil
@@ -720,6 +772,12 @@ local function fullUnload()
 	cfg.FreecamEnabled = false
 	cfg.AutoSprint = false
 	cfg.VerticalFreezeEnabled = false
+	cfg.GrappleEnabled = false
+	cfg.WallRunEnabled = false
+	cfg.CeilingWalkEnabled = false
+	cfg.TelekinesisEnabled = false
+	cfg.PhysicsTornadoEnabled = false
+	cfg.SurfaceSurferEnabled = false
 	cfg.TiltEnabled = false
 	cfg.SlowModeEnabled = false
 	cfg.BacklockEnabled = false
@@ -750,6 +808,7 @@ local function fullUnload()
 	cfg.JumpPowerValue = 50
 
 	if antiAfkConn then antiAfkConn:Disconnect(); antiAfkConn = nil end
+	if Motion.cleanup then pcall(Motion.cleanup) end
 	pcall(function() if updateSilent2Hitboxes then updateSilent2Hitboxes(1) end end)
 
 	for part, _ in pairs(xrayApplied) do
@@ -814,6 +873,12 @@ local function quickResetMovement()
 	cfg.FreecamEnabled = false
 	cfg.AutoSprint = false
 	cfg.VerticalFreezeEnabled = false
+	cfg.GrappleEnabled = false
+	cfg.WallRunEnabled = false
+	cfg.CeilingWalkEnabled = false
+	cfg.TelekinesisEnabled = false
+	cfg.PhysicsTornadoEnabled = false
+	cfg.SurfaceSurferEnabled = false
 	cfg.TiltEnabled = false
 	cfg.SlowModeEnabled = false
 	cfg.SilentAim1Enabled = false
@@ -840,6 +905,7 @@ local function quickResetMovement()
 	cfg.JumpPowerValue = 50
 	cfg.PlayerGravity = 196.2
 	verticalFreezeY = nil
+	Motion.cleanup()
 	setCharacterCollision(true)
 	setFreecam(false)
 end
@@ -1222,6 +1288,7 @@ end
 
 local function updateFOVCircle()
 	local center = getAimOrigin2D()
+	lastFOVViewportSize = Camera and Camera.ViewportSize or Vector2.zero
 	local d = cfg.AimFOV * 2
 	fovCircle.Size = UDim2.fromOffset(d, d)
 	fovCircle.Position = UDim2.fromOffset(center.X, center.Y)
@@ -1526,7 +1593,7 @@ markVisualDirty = function(p: Player)
 	end
 end
 
-local function refreshAllVisuals(force: boolean?)
+local function processDirtyVisualQueue(force: boolean?)
 	if isUnloaded then return end
 	local t = os.clock()
 	if (not force) and (t - lastVisualRefreshAt < 0.15) then return end
@@ -1696,7 +1763,7 @@ local function onLocalCharacterReset()
 	refreshLOSFilter()
 	lastHideLocalApplied = nil
 	verticalFreezeY = nil
-	refreshAllVisuals(true)
+	processDirtyVisualQueue(true)
 	if cfg.NoClipEnabled then
 		task.defer(function()
 			setCharacterCollision(false)
@@ -2063,8 +2130,38 @@ local function getAimPointForPart(part: BasePart): Vector3
 	return point or part.Position
 end
 
+local function getPredictedAimPoint(part: BasePart, rawPoint: Vector3): Vector3
+	if not cfg.AimPredictionEnabled then return rawPoint end
+	local predictionTime = math.clamp(cfg.AimPredictionTime or 0, 0, 0.5)
+	if predictionTime <= 0 then return rawPoint end
+	local velocity = part.AssemblyLinearVelocity
+	local lead = velocity * predictionTime
+	if lead.Magnitude > 35 then
+		lead = lead.Unit * 35
+	end
+	return rawPoint + lead
+end
+
+local function getSmoothedAimPoint(part: BasePart, targetPoint: Vector3, dt: number): Vector3
+	if aimFilteredPart ~= part or not aimFilteredPoint then
+		aimFilteredPart = part
+		aimFilteredPoint = targetPoint
+		return targetPoint
+	end
+	local smoothness = math.clamp(cfg.AimTrackingSmoothness or 0, 0, 100)
+	local response = 30 - smoothness * 0.26
+	local alpha = 1 - math.exp(-response * math.max(dt, 0))
+	aimFilteredPoint = aimFilteredPoint:Lerp(targetPoint, math.clamp(alpha, 0, 1))
+	return aimFilteredPoint
+end
+
 function doSilentAim1Shot()
-	-- SilentAim1 now works via ray/mouse hooks below (no camera snap).
+	if not cfg.SilentAim1Enabled or cfg.MenuVisible or cfg.FreecamEnabled then return end
+	local part = getSilentAimPart()
+	if part then
+		silent1PrelockPart = part
+		silent1PrelockUntil = os.clock() + 0.35
+	end
 end
 
 local function calculateDirection(origin: Vector3, destination: Vector3, length: number?): Vector3
@@ -2077,12 +2174,15 @@ local function calculateDirection(origin: Vector3, destination: Vector3, length:
 end
 
 local function silentAim1Active(): boolean
-	-- Silent Aim 1 is gated by the main Aim toggle and uses the same Aim FOV.
-	-- AutoMouse1 should work even without holding M1.
-	return cfg.AimEnabled and cfg.SilentAim1Enabled and (not cfg.MenuVisible) and (not cfg.FreecamEnabled)
-		and (isAimInputActive() or cfg.SilentAim1AutoMouse1)
+	return cfg.SilentAim1Enabled and (not cfg.MenuVisible) and (not cfg.FreecamEnabled)
 end
 
+function getSilentHookPart(): BasePart?
+	if silent1PrelockPart and silent1PrelockPart.Parent and os.clock() <= silent1PrelockUntil then
+		return silent1PrelockPart
+	end
+	return getSilentAimPart()
+end
 
 pcall(function()
 	if hookmetamethod and getnamecallmethod and checkcaller then
@@ -2103,22 +2203,23 @@ pcall(function()
 			end
 
 			local method = getnamecallmethod()
-			local part = getSilentAimPart()
+			local part = getSilentHookPart()
 			if not part then
 				return __namecall(...)
 			end
 
 			if method == "Raycast" and typeof(args[2]) == "Vector3" and typeof(args[3]) == "Vector3" then
-				args[3] = calculateDirection(args[2], getAimPointForPart(part), 1000)
+				args[3] = calculateDirection(args[2], getAimPointForPart(part), math.max(1, args[3].Magnitude))
 				return __namecall(unpack(args))
 			elseif (method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist") and typeof(args[2]) == "Ray" then
 				local origin = args[2].Origin
-				args[2] = Ray.new(origin, calculateDirection(origin, getAimPointForPart(part), 1000))
+				args[2] = Ray.new(origin, calculateDirection(origin, getAimPointForPart(part), math.max(1, args[2].Direction.Magnitude)))
 				return __namecall(unpack(args))
 			end
 
 			return __namecall(...)
 		end)
+		Motion.silentNamecallHook = true
 	end
 end)
 
@@ -2134,8 +2235,8 @@ pcall(function()
 				return __index(t, k)
 			end
 
-			if t:IsA("Mouse") then
-				local part = getSilentAimPart()
+			if typeof(t) == "Instance" and t:IsA("Mouse") then
+				local part = getSilentHookPart()
 				if part then
 					if k == "Target" then
 						return part
@@ -2152,6 +2253,23 @@ pcall(function()
 
 			return __index(t, k)
 		end)
+		Motion.silentIndexHook = true
+	end
+end)
+
+pcall(function()
+	if hookfunction and checkcaller and Workspace.Raycast then
+		local oldRaycast
+		oldRaycast = hookfunction(Workspace.Raycast, function(self, origin, direction, params)
+			if (not checkcaller()) and silentAim1Active() and typeof(origin) == "Vector3" and typeof(direction) == "Vector3" then
+				local part = getSilentHookPart()
+				if part then
+					direction = calculateDirection(origin, getAimPointForPart(part), math.max(1, direction.Magnitude))
+				end
+			end
+			return oldRaycast(self, origin, direction, params)
+		end)
+		Motion.silentDirectRayHook = true
 	end
 end)
 
@@ -2192,8 +2310,346 @@ function updateSilent2Hitboxes(dt)
 	end
 end
 
+function Motion.getLocalState(): (Model?, Humanoid?, BasePart?)
+	local character = LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and resolveCharacterRoot(character)
+	return character, humanoid, root
+end
+
+function Motion.raycast(origin: Vector3, direction: Vector3): RaycastResult?
+	local character = LocalPlayer.Character
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = character and {character} or {}
+	params.IgnoreWater = true
+	return Workspace:Raycast(origin, direction, params)
+end
+
+function Motion.stopGrapple()
+	Motion.grappleHeld = false
+	Motion.grapplePoint = nil
+	for _, object in ipairs({Motion.grappleBeam, Motion.grappleRootAttachment, Motion.grappleAnchor}) do
+		if typeof(object) == "Instance" then pcall(function() object:Destroy() end) end
+	end
+	Motion.grappleBeam = nil
+	Motion.grappleRootAttachment = nil
+	Motion.grappleAnchor = nil
+end
+
+function Motion.startGrapple()
+	if not cfg.GrappleEnabled or not Camera or cfg.MenuVisible then return end
+	local _, _, root = Motion.getLocalState()
+	if not root then return end
+	local viewport = Camera.ViewportSize
+	local ray = Camera:ViewportPointToRay(viewport.X * 0.5, viewport.Y * 0.5)
+	local hit = Motion.raycast(ray.Origin, ray.Direction * cfg.GrappleRange)
+	if not hit then return end
+	Motion.stopGrapple()
+	Motion.grappleHeld = true
+	Motion.grapplePoint = hit.Position
+
+	local anchor = Instance.new("Part")
+	anchor.Name = "AetherGrappleAnchor"
+	anchor.Size = Vector3.new(0.2, 0.2, 0.2)
+	anchor.Transparency = 1
+	anchor.Anchored = true
+	anchor.CanCollide = false
+	anchor.CanQuery = false
+	anchor.CFrame = CFrame.new(hit.Position)
+	anchor.Parent = Workspace
+	local anchorAttachment = Instance.new("Attachment")
+	anchorAttachment.Parent = anchor
+	local rootAttachment = Instance.new("Attachment")
+	rootAttachment.Name = "AetherGrappleAttachment"
+	rootAttachment.Parent = root
+	local beam = Instance.new("Beam")
+	beam.Attachment0 = rootAttachment
+	beam.Attachment1 = anchorAttachment
+	beam.Width0 = 0.08
+	beam.Width1 = 0.04
+	beam.FaceCamera = true
+	beam.Color = ColorSequence.new(Color3.fromRGB(120, 210, 255), Color3.fromRGB(235, 245, 255))
+	beam.Parent = rootAttachment
+	Motion.grappleAnchor = anchor
+	Motion.grappleRootAttachment = rootAttachment
+	Motion.grappleBeam = beam
+end
+
+function Motion.stopCeilingWalk()
+	Motion.ceilingActive = false
+	local _, humanoid = Motion.getLocalState()
+	if humanoid then humanoid.AutoRotate = true end
+	for _, object in ipairs({Motion.ceilingForce, Motion.ceilingOrientation, Motion.ceilingAttachment}) do
+		if typeof(object) == "Instance" then pcall(function() object:Destroy() end) end
+	end
+	Motion.ceilingForce = nil
+	Motion.ceilingOrientation = nil
+	Motion.ceilingAttachment = nil
+end
+
+function Motion.toggleCeilingWalk()
+	if not cfg.CeilingWalkEnabled or not Camera or cfg.MenuVisible then
+		Motion.stopCeilingWalk()
+		return
+	end
+	if Motion.ceilingActive then
+		Motion.stopCeilingWalk()
+		return
+	end
+	local _, humanoid, root = Motion.getLocalState()
+	if not humanoid or not root then return end
+	local viewport = Camera.ViewportSize
+	local ray = Camera:ViewportPointToRay(viewport.X * 0.5, viewport.Y * 0.5)
+	local hit = Motion.raycast(ray.Origin, ray.Direction * 35)
+	if not hit then return end
+	Motion.ceilingActive = true
+	Motion.ceilingNormal = hit.Normal
+	humanoid.AutoRotate = false
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "AetherSurfaceAttachment"
+	attachment.Parent = root
+	local force = Instance.new("VectorForce")
+	force.Name = "AetherSurfaceGravity"
+	force.Attachment0 = attachment
+	force.RelativeTo = Enum.ActuatorRelativeTo.World
+	force.ApplyAtCenterOfMass = true
+	force.Parent = root
+	local orientation = Instance.new("AlignOrientation")
+	orientation.Name = "AetherSurfaceOrientation"
+	orientation.Attachment0 = attachment
+	orientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	orientation.RigidityEnabled = false
+	orientation.Responsiveness = 35
+	orientation.MaxTorque = 1e9
+	orientation.Parent = root
+	Motion.ceilingAttachment = attachment
+	Motion.ceilingForce = force
+	Motion.ceilingOrientation = orientation
+end
+
+function Motion.releaseTelekinesis(throwObject: boolean?)
+	local part = Motion.telePart
+	for _, object in ipairs({Motion.telePosition, Motion.teleOrientation, Motion.telePartAttachment}) do
+		if typeof(object) == "Instance" then pcall(function() object:Destroy() end) end
+	end
+	Motion.telePosition = nil
+	Motion.teleOrientation = nil
+	Motion.telePartAttachment = nil
+	Motion.telePart = nil
+	if throwObject and part and part.Parent and Camera then
+		pcall(function()
+			part.AssemblyLinearVelocity = Camera.CFrame.LookVector * cfg.TelekinesisPower
+			part.AssemblyAngularVelocity = Vector3.new(0, 8, 0)
+		end)
+	end
+end
+
+function Motion.toggleTelekinesis()
+	if Motion.telePart then
+		Motion.releaseTelekinesis(false)
+		return
+	end
+	if not cfg.TelekinesisEnabled or not Camera or cfg.MenuVisible then return end
+	local viewport = Camera.ViewportSize
+	local ray = Camera:ViewportPointToRay(viewport.X * 0.5, viewport.Y * 0.5)
+	local hit = Motion.raycast(ray.Origin, ray.Direction * 300)
+	local part = hit and hit.Instance
+	if not part or not part:IsA("BasePart") or part.Anchored then return end
+	if part.AssemblyMass > cfg.TelekinesisMaxMass then
+		notify("Object is too heavy")
+		return
+	end
+	local model = part:FindFirstAncestorOfClass("Model")
+	if model and model:FindFirstChildOfClass("Humanoid") then return end
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "AetherTeleAttachment"
+	attachment.Parent = part
+	local position = Instance.new("AlignPosition")
+	position.Name = "AetherTelePosition"
+	position.Attachment0 = attachment
+	position.Mode = Enum.PositionAlignmentMode.OneAttachment
+	position.ApplyAtCenterOfMass = true
+	position.MaxForce = math.max(50000, part.AssemblyMass * 12000)
+	position.MaxVelocity = 180
+	position.Responsiveness = 45
+	position.Parent = part
+	local orientation = Instance.new("AlignOrientation")
+	orientation.Name = "AetherTeleOrientation"
+	orientation.Attachment0 = attachment
+	orientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	orientation.MaxTorque = math.max(50000, part.AssemblyMass * 12000)
+	orientation.Responsiveness = 35
+	orientation.Parent = part
+	Motion.telePart = part
+	Motion.telePartAttachment = attachment
+	Motion.telePosition = position
+	Motion.teleOrientation = orientation
+end
+
+function Motion.scanTornado()
+	table.clear(Motion.tornadoParts)
+	if not cfg.PhysicsTornadoEnabled then return end
+	local character, _, root = Motion.getLocalState()
+	if not root then return end
+	local overlap = OverlapParams.new()
+	overlap.FilterType = Enum.RaycastFilterType.Exclude
+	overlap.FilterDescendantsInstances = character and {character} or {}
+	local count = 0
+	for _, part in ipairs(Workspace:GetPartBoundsInRadius(root.Position, cfg.PhysicsTornadoRadius, overlap)) do
+		if part:IsA("BasePart") and not part.Anchored and part ~= Motion.telePart and part.AssemblyMass <= cfg.TelekinesisMaxMass then
+			local model = part:FindFirstAncestorOfClass("Model")
+			if not model or not model:FindFirstChildOfClass("Humanoid") then
+				table.insert(Motion.tornadoParts, part)
+				count += 1
+				if count >= cfg.PhysicsTornadoMaxParts then break end
+			end
+		end
+	end
+end
+
+function Motion.blastTornado()
+	local _, _, root = Motion.getLocalState()
+	if not root then return end
+	for _, part in ipairs(Motion.tornadoParts) do
+		if part and part.Parent and not part.Anchored then
+			local delta = part.Position - root.Position
+			local direction = delta.Magnitude > 0.01 and delta.Unit or Vector3.yAxis
+			pcall(function()
+				part.AssemblyLinearVelocity = direction * (cfg.PhysicsTornadoForce * 1.7) + Vector3.new(0, cfg.PhysicsTornadoForce * 0.55, 0)
+			end)
+		end
+	end
+	table.clear(Motion.tornadoParts)
+	Motion.tornadoActive = false
+end
+
+function Motion.step(dt: number)
+	local character, humanoid, root = Motion.getLocalState()
+	if not character or not humanoid or not root or humanoid.Health <= 0 then
+		Motion.stopGrapple()
+		Motion.stopCeilingWalk()
+		Motion.releaseTelekinesis(false)
+		table.clear(Motion.tornadoParts)
+		return
+	end
+
+	if Motion.grappleHeld and cfg.GrappleEnabled and Motion.grapplePoint then
+		local delta = Motion.grapplePoint - root.Position
+		if delta.Magnitude > 3 then
+			local velocity = root.AssemblyLinearVelocity + delta.Unit * cfg.GrapplePull * dt
+			if velocity.Magnitude > cfg.GrappleMaxSpeed then velocity = velocity.Unit * cfg.GrappleMaxSpeed end
+			root.AssemblyLinearVelocity = velocity
+		else
+			Motion.stopGrapple()
+		end
+	elseif Motion.grappleHeld then
+		Motion.stopGrapple()
+	end
+
+	if cfg.WallRunEnabled and not Motion.ceilingActive and humanoid.FloorMaterial == Enum.Material.Air and (moveKeys.W or UserInputService:IsKeyDown(Enum.KeyCode.W)) then
+		local leftHit = Motion.raycast(root.Position, -root.CFrame.RightVector * 4)
+		local rightHit = Motion.raycast(root.Position, root.CFrame.RightVector * 4)
+		local wall = leftHit or rightHit
+		if wall and math.abs(wall.Normal.Y) < 0.3 then
+			local tangent = Vector3.yAxis:Cross(wall.Normal)
+			if tangent:Dot(root.CFrame.LookVector) < 0 then tangent = -tangent end
+			root.AssemblyLinearVelocity = tangent.Unit * cfg.WallRunSpeed + Vector3.new(0, cfg.WallRunLift, 0)
+			root.CFrame = CFrame.lookAt(root.Position, root.Position + tangent, Vector3.yAxis)
+		end
+	end
+
+	if Motion.ceilingActive then
+		if not cfg.CeilingWalkEnabled or not Motion.ceilingForce or not Motion.ceilingOrientation then
+			Motion.stopCeilingWalk()
+		else
+			local normal = Motion.ceilingNormal
+			local towardSurface = -normal
+			local surfaceHit = Motion.raycast(root.Position, towardSurface * 5)
+			if surfaceHit then
+				normal = surfaceHit.Normal
+				Motion.ceilingNormal = normal
+				towardSurface = -normal
+			end
+			Motion.ceilingForce.Force = Vector3.new(0, Workspace.Gravity * root.AssemblyMass, 0)
+				+ towardSurface * cfg.CeilingWalkGravity * root.AssemblyMass
+			local forward = Camera and Camera.CFrame.LookVector or root.CFrame.LookVector
+			forward -= normal * forward:Dot(normal)
+			if forward.Magnitude < 0.01 then forward = root.CFrame.LookVector end
+			forward = forward.Unit
+			local right = forward:Cross(normal).Unit
+			Motion.ceilingOrientation.CFrame = CFrame.fromMatrix(Vector3.zero, right, normal, -forward)
+			local move = humanoid.MoveDirection
+			move -= normal * move:Dot(normal)
+			local normalVelocity = normal * root.AssemblyLinearVelocity:Dot(normal)
+			if move.Magnitude > 0.01 then
+				root.AssemblyLinearVelocity = move.Unit * cfg.CeilingWalkSpeed + normalVelocity
+			end
+		end
+	end
+
+	if Motion.telePart and cfg.TelekinesisEnabled and Camera and Motion.telePosition and Motion.teleOrientation then
+		if not Motion.telePart.Parent or Motion.telePart.Anchored then
+			Motion.releaseTelekinesis(false)
+		else
+			Motion.telePosition.Position = Camera.CFrame.Position + Camera.CFrame.LookVector * cfg.TelekinesisDistance
+			Motion.teleOrientation.CFrame = Camera.CFrame.Rotation
+		end
+	elseif Motion.telePart then
+		Motion.releaseTelekinesis(false)
+	end
+
+	if cfg.PhysicsTornadoEnabled and Motion.tornadoActive then
+		Motion.tornadoScanAcc += dt
+		Motion.tornadoAngle += dt * 4
+		if Motion.tornadoScanAcc >= 0.3 then
+			Motion.tornadoScanAcc = 0
+			Motion.scanTornado()
+		end
+		for index, part in ipairs(Motion.tornadoParts) do
+			if part and part.Parent and not part.Anchored then
+				local angle = Motion.tornadoAngle + index * 2.399
+				local radius = 5 + (index % 5) * 1.5
+				local height = 2 + (index % 7) * 1.2
+				local target = root.Position + Vector3.new(math.cos(angle) * radius, height, math.sin(angle) * radius)
+				local delta = target - part.Position
+				pcall(function()
+					part.AssemblyLinearVelocity = delta * 5 + Vector3.new(-math.sin(angle), 0, math.cos(angle)) * cfg.PhysicsTornadoForce
+				end)
+			end
+		end
+	else
+		table.clear(Motion.tornadoParts)
+	end
+
+	if cfg.SurfaceSurferEnabled and not Motion.ceilingActive and humanoid.FloorMaterial ~= Enum.Material.Air and (moveKeys.W or UserInputService:IsKeyDown(Enum.KeyCode.W)) then
+		local floor = Motion.raycast(root.Position, Vector3.new(0, -5, 0))
+		if floor and floor.Normal.Y > 0.2 then
+			local normal = floor.Normal
+			local forward = Camera and Camera.CFrame.LookVector or root.CFrame.LookVector
+			forward = Vector3.new(forward.X, 0, forward.Z)
+			forward -= normal * forward:Dot(normal)
+			if forward.Magnitude > 0.01 then
+				local planar = root.AssemblyLinearVelocity - normal * root.AssemblyLinearVelocity:Dot(normal)
+				local target = forward.Unit * cfg.SurfaceSurferSpeed
+				local blend = math.clamp(cfg.SurfaceSurferAcceleration * dt / math.max(1, cfg.SurfaceSurferSpeed), 0, 1)
+				root.AssemblyLinearVelocity = planar:Lerp(target, blend) - normal * 2
+			end
+		end
+	end
+end
+
+function Motion.cleanup()
+	Motion.stopGrapple()
+	Motion.stopCeilingWalk()
+	Motion.releaseTelekinesis(false)
+	Motion.tornadoActive = false
+	table.clear(Motion.tornadoParts)
+end
+
 RunService.RenderStepped:Connect(function(dt)
 	if isUnloaded then return end
+	Motion.step(dt)
 	if cfg.FreecamEnabled and Camera then
 		if Camera.CameraType ~= Enum.CameraType.Scriptable then
 			Camera.CameraType = Enum.CameraType.Scriptable
@@ -2246,7 +2702,7 @@ RunService.RenderStepped:Connect(function(dt)
 		lastSpectatorSignature = ""
 	end
 
-	if silentAim1Active() then
+	if silentAim1Active() and (isAimInputActive() or cfg.SilentAim1AutoMouse1) then
 		silent1HoldAcc += dt
 		if silent1HoldAcc >= 0.045 then
 			silent1HoldAcc = 0
@@ -2276,7 +2732,6 @@ RunService.RenderStepped:Connect(function(dt)
 				end
 				part = part or getSilentAimPart(true)
 				if part then
-					emulateMouse1Click()
 					rapidFireOnce()
 				end
 			end
@@ -2345,7 +2800,9 @@ RunService.RenderStepped:Connect(function(dt)
 		chRight.BackgroundColor3 = color
 	end
 
-	updateFOVCircle()
+	if Camera and Camera.ViewportSize ~= lastFOVViewportSize then
+		updateFOVCircle()
+	end
 
 	local normalAimRuntimeEnabled = cfg.AimEnabled and (not cfg.SilentAim1Enabled)
 	local currentAimPart: BasePart? = nil
@@ -2354,7 +2811,9 @@ RunService.RenderStepped:Connect(function(dt)
 		currentAimPart = part
 		if part then
 			local camPos = Camera.CFrame.Position
-			local aimPoint = getAimPointForPart(part)
+			local rawAimPoint = getAimPointForPart(part)
+			local predictedAimPoint = getPredictedAimPoint(part, rawAimPoint)
+			local aimPoint = getSmoothedAimPoint(part, predictedAimPoint, dt)
 			local targetCF = CFrame.new(camPos, aimPoint)
 			local baseSpeed = math.clamp(cfg.AimSmoothness or 0, 0, 100)
 			local speed = baseSpeed
@@ -2366,9 +2825,17 @@ RunService.RenderStepped:Connect(function(dt)
 				local factor = (100 / d) ^ strength01
 				speed = math.clamp(baseSpeed * factor, 0, 100)
 			end
-			local alpha = math.clamp(speed / 100, 0, 1)
+			local baseAlpha = math.clamp(speed / 100, 0, 1)
+			local alpha = baseAlpha >= 1 and 1 or 1 - ((1 - baseAlpha) ^ math.max(dt * 60, 0))
 			Camera.CFrame = Camera.CFrame:Lerp(targetCF, alpha)
 		end
+	else
+		aimFilteredPart = nil
+		aimFilteredPoint = nil
+	end
+	if normalAimRuntimeEnabled and not currentAimPart then
+		aimFilteredPart = nil
+		aimFilteredPoint = nil
 	end
 
 	if (not currentAimPart) then
@@ -2589,7 +3056,7 @@ RunService.RenderStepped:Connect(function(dt)
 	end
 
 	-- process queued visual refreshes + dynamic visual updates (throttled)
-	refreshAllVisuals()
+	processDirtyVisualQueue()
 	processVisualStyleQueue()
 	processChamsColorQueue()
 	visualAuditAcc += dt
@@ -2906,14 +3373,11 @@ UserInputService.InputEnded:Connect(function(input)
 	if input.KeyCode == Enum.KeyCode.Q then moveKeys.Q = false end
 end)
 
-refreshHitboxUI()
 updateFOVCircle()
-refreshAllVisuals()
-refreshXray()
 
 local function bootAetherMenuApi()
-	local AETHER_MENU_API_URL = "https://files.catbox.moe/ajeca8.lua"
-	local REQUIRED_MENU_API_VERSION = "8.1.0"
+	local AETHER_MENU_API_URL = "https://raw.githubusercontent.com/Sqidsoff/sakanig4dick/refs/heads/main/menu_api.lua"
+	local REQUIRED_MENU_API_VERSION = "8.1.1"
 	local loaderSource: string? = nil
 
 	local function fetchText(url: string): string?
@@ -2970,12 +3434,8 @@ local function bootAetherMenuApi()
 		return source and string.match(source, 'Library%.Version%s*=%s*"([^"]+)"') or nil
 	end
 
-	loaderSource = fetchText(AETHER_MENU_API_URL)
-	if loaderSource and not versionAtLeast(sourceVersion(loaderSource), REQUIRED_MENU_API_VERSION) then
-		loaderSource = nil
-	end
 	pcall(function()
-		if not loaderSource and readfile then
+		if readfile then
 			local okA, srcA = pcall(function() return readfile("D:\\it\\Lua\\menu_api.lua") end)
 			if okA then loaderSource = srcA end
 			if not loaderSource then
@@ -2984,6 +3444,15 @@ local function bootAetherMenuApi()
 			end
 		end
 	end)
+	if loaderSource and not versionAtLeast(sourceVersion(loaderSource), REQUIRED_MENU_API_VERSION) then
+		loaderSource = nil
+	end
+	if not loaderSource then
+		loaderSource = fetchText(AETHER_MENU_API_URL)
+		if loaderSource and not versionAtLeast(sourceVersion(loaderSource), REQUIRED_MENU_API_VERSION) then
+			loaderSource = nil
+		end
+	end
 	if not loaderSource then
 		notify("Menu API " .. REQUIRED_MENU_API_VERSION .. "+ is required; update Catbox or keep local menu_api.lua")
 		return
@@ -3070,6 +3539,7 @@ local function bootAetherMenuApi()
 			end
 		end)
 		api.Events:On("LocalCharacterRemoving", function()
+			Motion.cleanup()
 			stickyTargetPlayer = nil
 			stickyTargetPart = nil
 			stickyTargetUntil = 0
@@ -3143,14 +3613,24 @@ local function bootAetherMenuApi()
 	slider("AimSmoothness", aim, "Aim speed", 0, 100, 1)
 	slider("AimMaxDistance", aim, "Aim max distance", 50, 2000, 25)
 	slider("AimMultiPointScale", aim, "Multipoint scale", 0.05, 0.95, 0.05)
+	bool("AimPredictionEnabled", aim, "Movement prediction")
+	slider("AimPredictionTime", aim, "Prediction time", 0, 0.50, 0.01)
+	slider("AimTrackingSmoothness", aim, "Tracking smoothness", 0, 100, 1)
 	drop("AimHitbox", aim, "Fixed hitbox", HITBOX_LIST, function() refreshHitboxUI() end)
 	drop("AimInputMode", aim, "Aim input mode", {"Hold", "Toggle"})
 	slider("AimToggleDoublePressWindow", aim, "Toggle double-click window", 0.10, 0.60, 0.05)
 	aim:Section("Silent / fire")
-	bool("SilentAim1Enabled", aim, "Silent aim 1")
+	bool("SilentAim1Enabled", aim, "Silent aim 1", function(v)
+		updateFOVCircle()
+		silent1PrelockPart = nil
+		silent1PrelockUntil = 0
+		if v and not (Motion.silentNamecallHook or Motion.silentIndexHook or Motion.silentDirectRayHook) then
+			notify("Silent 1: executor has no supported hook API")
+		end
+	end)
 	bool("SilentAim1AutoMouse1", aim, "Silent1 auto mouse")
 	slider("SilentAim1AutoMouse1Interval", aim, "Silent1 interval", 0.03, 0.20, 0.01)
-	bool("SilentAim2Enabled", aim, "Silent aim 2")
+	bool("SilentAim2Enabled", aim, "Silent aim 2", function() updateFOVCircle() end)
 	bool("TriggerbotEnabled", aim, "Triggerbot")
 	slider("TriggerbotRadius", aim, "Triggerbot radius", 6, 60, 1)
 	bool("RapidFireEnabled", aim, "Rapid fire")
@@ -3188,8 +3668,8 @@ local function bootAetherMenuApi()
 	slider("ESPMaxDistance", esp, "ESP max distance", 100, 3000, 50, applyVisualSettings)
 	esp:Section("Crosshair")
 	bool("CrosshairEnabled", esp, "Crosshair", function() updateFOVCircle() end)
-	slider("CrosshairSize", esp, "Crosshair size", 2, 20, 1)
-	slider("CrosshairGap", esp, "Crosshair gap", 1, 12, 1)
+	slider("CrosshairSize", esp, "Crosshair size", 2, 20, 1, function() updateFOVCircle() end)
+	slider("CrosshairGap", esp, "Crosshair gap", 1, 12, 1, function() updateFOVCircle() end)
 
 	move:Section("Movement")
 	bool("BhopEnabled", move, "Bhop")
@@ -3204,6 +3684,73 @@ local function bootAetherMenuApi()
 	slider("JumpPowerValue", move, "Jump power", 1, 300, 1)
 	slider("PlayerGravity", move, "Player gravity", 0, 500, 1)
 	bool("VerticalFreezeEnabled", move, "Vertical freeze", function(v) if not v then verticalFreezeY = nil end end)
+	move:Section("Traversal mechanics")
+	bool("GrappleEnabled", move, "Grappling hook", function(v) if not v then Motion.stopGrapple() end end)
+	window:AddButton(move, {
+		id = "GrappleAction",
+		label = "Grapple action",
+		text = "GRAPPLE",
+		fire = Motion.startGrapple,
+		release = Motion.stopGrapple,
+	})
+	slider("GrappleRange", move, "Grapple range", 50, 1500, 25)
+	slider("GrapplePull", move, "Grapple pull", 20, 300, 5)
+	slider("GrappleMaxSpeed", move, "Grapple max speed", 40, 350, 5)
+	bool("WallRunEnabled", move, "Wall run")
+	slider("WallRunSpeed", move, "Wall run speed", 20, 160, 2)
+	slider("WallRunLift", move, "Wall run lift", -10, 40, 1)
+	bool("CeilingWalkEnabled", move, "Surface/ceiling walk", function(v) if not v then Motion.stopCeilingWalk() end end)
+	window:AddButton(move, {
+		id = "CeilingWalkAction",
+		label = "Surface walk attach/detach",
+		text = "ATTACH",
+		fire = Motion.toggleCeilingWalk,
+	})
+	slider("CeilingWalkSpeed", move, "Surface walk speed", 8, 100, 1)
+	slider("CeilingWalkGravity", move, "Surface adhesion", 20, 250, 5)
+	bool("SurfaceSurferEnabled", move, "Surface surfer")
+	slider("SurfaceSurferSpeed", move, "Surf speed", 20, 180, 2)
+	slider("SurfaceSurferAcceleration", move, "Surf acceleration", 10, 250, 5)
+
+	tools:Section("Physics control")
+	bool("TelekinesisEnabled", tools, "Telekinesis", function(v) if not v then Motion.releaseTelekinesis(false) end end)
+	window:AddButton(tools, {
+		id = "TelekinesisAction",
+		label = "Telekinesis grab/release",
+		text = "GRAB",
+		fire = Motion.toggleTelekinesis,
+	})
+	window:AddButton(tools, {
+		id = "TelekinesisThrowAction",
+		label = "Telekinesis throw",
+		text = "THROW",
+		fire = function() Motion.releaseTelekinesis(true) end,
+	})
+	slider("TelekinesisDistance", tools, "Telekinesis hold distance", 5, 60, 1)
+	slider("TelekinesisPower", tools, "Telekinesis throw power", 20, 400, 5)
+	slider("TelekinesisMaxMass", tools, "Physics max mass", 10, 1000, 10)
+	bool("PhysicsTornadoEnabled", tools, "Physics tornado", function(v)
+		if not v then Motion.tornadoActive = false; table.clear(Motion.tornadoParts) end
+	end)
+	window:AddButton(tools, {
+		id = "PhysicsTornadoAction",
+		label = "Tornado start/stop",
+		text = "TOGGLE",
+		fire = function()
+			if not cfg.PhysicsTornadoEnabled then return end
+			Motion.tornadoActive = not Motion.tornadoActive
+			if Motion.tornadoActive then Motion.scanTornado() else table.clear(Motion.tornadoParts) end
+		end,
+	})
+	window:AddButton(tools, {
+		id = "PhysicsTornadoBlastAction",
+		label = "Tornado blast",
+		text = "BLAST",
+		fire = Motion.blastTornado,
+	})
+	slider("PhysicsTornadoRadius", tools, "Tornado radius", 8, 100, 2)
+	slider("PhysicsTornadoForce", tools, "Tornado force", 20, 300, 5)
+	slider("PhysicsTornadoMaxParts", tools, "Tornado max parts", 4, 60, 1)
 
 	cam:Section("Camera")
 	bool("FreecamEnabled", cam, "Freecam", function(v) setFreecam(v) end)

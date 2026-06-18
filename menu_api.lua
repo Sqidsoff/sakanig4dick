@@ -1,6 +1,6 @@
 local Library = {}
 Library.Name = "Aether"
-Library.Version = "8.1.0"
+Library.Version = "8.1.1"
 
 function Library:CreateWindow(env)
 	env = env or {}
@@ -335,8 +335,6 @@ function Library:CreateWindow(env)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then return "MouseButton1" end
 		if input.UserInputType == Enum.UserInputType.MouseButton2 then return "MouseButton2" end
 		if input.UserInputType == Enum.UserInputType.MouseButton3 then return "MouseButton3" end
-		if input.UserInputType == Enum.UserInputType.MouseButton4 then return "MouseButton4" end
-		if input.UserInputType == Enum.UserInputType.MouseButton5 then return "MouseButton5" end
 		return nil
 	end
 
@@ -1360,6 +1358,8 @@ end
 			end
 		elseif isDown and control.kind == "button" then
 			control.fire()
+		elseif (not isDown) and mode == "Hold" and control.kind == "button" and control.release then
+			control.release()
 		elseif isDown and control.kind == "textbox" then
 			control.set(tostring(rawValue or ""))
 		end
@@ -1967,6 +1967,7 @@ end
 			label = label,
 			kind = "button",
 			fire = options.fire or function() end,
+			release = options.release,
 			refresh = function() end,
 		}
 		run.MouseButton1Click:Connect(control.fire)
