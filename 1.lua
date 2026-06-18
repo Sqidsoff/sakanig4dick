@@ -90,6 +90,9 @@ local cfg = {
 	TriggerbotEnabled = false,
 	TriggerbotRadius = 18,
 	VerticalFreezeEnabled = false,
+	FlyEnabled = false,
+	FlySpeed = 90,
+	FlyAcceleration = 12,
 	GrappleEnabled = false,
 	GrappleRange = 650,
 	GrapplePull = 115,
@@ -241,6 +244,7 @@ local Phantom = {
 	scanAcc = 0,
 }
 local Motion = {
+	flyActive = false,
 	grappleHeld = false,
 	grapplePoint = nil,
 	grappleAnchor = nil,
@@ -772,6 +776,7 @@ local function fullUnload()
 	cfg.FreecamEnabled = false
 	cfg.AutoSprint = false
 	cfg.VerticalFreezeEnabled = false
+	cfg.FlyEnabled = false
 	cfg.GrappleEnabled = false
 	cfg.WallRunEnabled = false
 	cfg.CeilingWalkEnabled = false
@@ -873,6 +878,7 @@ local function quickResetMovement()
 	cfg.FreecamEnabled = false
 	cfg.AutoSprint = false
 	cfg.VerticalFreezeEnabled = false
+	cfg.FlyEnabled = false
 	cfg.GrappleEnabled = false
 	cfg.WallRunEnabled = false
 	cfg.CeilingWalkEnabled = false
@@ -1764,7 +1770,7 @@ local function onLocalCharacterReset()
 	lastHideLocalApplied = nil
 	verticalFreezeY = nil
 	processDirtyVisualQueue(true)
-	if cfg.NoClipEnabled then
+	if cfg.NoClipEnabled or cfg.FlyEnabled then
 		task.defer(function()
 			setCharacterCollision(false)
 		end)
@@ -2524,9 +2530,31 @@ function Motion.blastTornado()
 	Motion.tornadoActive = false
 end
 
+function Motion.stopFly()
+	if not Motion.flyActive then return end
+	Motion.flyActive = false
+	local character = LocalPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if root and root:IsA("BasePart") then
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+	if humanoid and humanoid.Health > 0 then
+		humanoid.AutoRotate = true
+		if humanoid:GetState() == Enum.HumanoidStateType.Physics then
+			humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+		end
+	end
+	if not cfg.NoClipEnabled then
+		setCharacterCollision(true)
+	end
+end
+
 function Motion.step(dt: number)
 	local character, humanoid, root = Motion.getLocalState()
 	if not character or not humanoid or not root or humanoid.Health <= 0 then
+		Motion.stopFly()
 		Motion.stopGrapple()
 		Motion.stopCeilingWalk()
 		Motion.releaseTelekinesis(false)
@@ -2534,7 +2562,35 @@ function Motion.step(dt: number)
 		return
 	end
 
-	if Motion.grappleHeld and cfg.GrappleEnabled and Motion.grapplePoint then
+	local flying = cfg.FlyEnabled and Camera ~= nil and not cfg.FreecamEnabled and not cfg.MenuVisible
+	if flying then
+		if not Motion.flyActive then
+			Motion.flyActive = true
+			setCharacterCollision(false)
+			Motion.stopGrapple()
+			Motion.stopCeilingWalk()
+		end
+		humanoid.AutoRotate = false
+		humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+		local cameraCF = Camera.CFrame
+		local direction = Vector3.zero
+		if moveKeys.W or UserInputService:IsKeyDown(Enum.KeyCode.W) then direction += cameraCF.LookVector end
+		if moveKeys.S or UserInputService:IsKeyDown(Enum.KeyCode.S) then direction -= cameraCF.LookVector end
+		if moveKeys.D or UserInputService:IsKeyDown(Enum.KeyCode.D) then direction += cameraCF.RightVector end
+		if moveKeys.A or UserInputService:IsKeyDown(Enum.KeyCode.A) then direction -= cameraCF.RightVector end
+		local targetVelocity = direction.Magnitude > 0.01 and direction.Unit * cfg.FlySpeed or Vector3.zero
+		local blend = 1 - math.exp(-math.max(1, cfg.FlyAcceleration) * dt)
+		root.AssemblyLinearVelocity = root.AssemblyLinearVelocity:Lerp(targetVelocity, blend)
+		root.AssemblyAngularVelocity = Vector3.zero
+		local flatLook = Vector3.new(cameraCF.LookVector.X, 0, cameraCF.LookVector.Z)
+		if flatLook.Magnitude > 0.01 then
+			root.CFrame = CFrame.lookAt(root.Position, root.Position + flatLook.Unit, Vector3.yAxis)
+		end
+	elseif Motion.flyActive then
+		Motion.stopFly()
+	end
+
+	if not flying and Motion.grappleHeld and cfg.GrappleEnabled and Motion.grapplePoint then
 		local delta = Motion.grapplePoint - root.Position
 		if delta.Magnitude > 3 then
 			local velocity = root.AssemblyLinearVelocity + delta.Unit * cfg.GrapplePull * dt
@@ -2547,7 +2603,7 @@ function Motion.step(dt: number)
 		Motion.stopGrapple()
 	end
 
-	if cfg.WallRunEnabled and not Motion.ceilingActive and humanoid.FloorMaterial == Enum.Material.Air and (moveKeys.W or UserInputService:IsKeyDown(Enum.KeyCode.W)) then
+	if not flying and cfg.WallRunEnabled and not Motion.ceilingActive and humanoid.FloorMaterial == Enum.Material.Air and (moveKeys.W or UserInputService:IsKeyDown(Enum.KeyCode.W)) then
 		local leftHit = Motion.raycast(root.Position, -root.CFrame.RightVector * 4)
 		local rightHit = Motion.raycast(root.Position, root.CFrame.RightVector * 4)
 		local wall = leftHit or rightHit
@@ -2559,7 +2615,7 @@ function Motion.step(dt: number)
 		end
 	end
 
-	if Motion.ceilingActive then
+	if Motion.ceilingActive and not flying then
 		if not cfg.CeilingWalkEnabled or not Motion.ceilingForce or not Motion.ceilingOrientation then
 			Motion.stopCeilingWalk()
 		else
@@ -2622,7 +2678,7 @@ function Motion.step(dt: number)
 		table.clear(Motion.tornadoParts)
 	end
 
-	if cfg.SurfaceSurferEnabled and not Motion.ceilingActive and humanoid.FloorMaterial ~= Enum.Material.Air and (moveKeys.W or UserInputService:IsKeyDown(Enum.KeyCode.W)) then
+	if not flying and cfg.SurfaceSurferEnabled and not Motion.ceilingActive and humanoid.FloorMaterial ~= Enum.Material.Air and (moveKeys.W or UserInputService:IsKeyDown(Enum.KeyCode.W)) then
 		local floor = Motion.raycast(root.Position, Vector3.new(0, -5, 0))
 		if floor and floor.Normal.Y > 0.2 then
 			local normal = floor.Normal
@@ -2640,6 +2696,7 @@ function Motion.step(dt: number)
 end
 
 function Motion.cleanup()
+	Motion.stopFly()
 	Motion.stopGrapple()
 	Motion.stopCeilingWalk()
 	Motion.releaseTelekinesis(false)
@@ -2880,6 +2937,11 @@ RunService.RenderStepped:Connect(function(dt)
 			hum.UseJumpPower = true
 			hum.JumpPower = 0
 			hum.AutoRotate = false
+		elseif cfg.FlyEnabled then
+			hum.WalkSpeed = 0
+			hum.UseJumpPower = true
+			hum.JumpPower = 0
+			hum.AutoRotate = false
 		else
 			local baseSpeed = cfg.AutoSprint and math.max(cfg.MoveSpeed, 26) or cfg.MoveSpeed
 			hum.WalkSpeed = cfg.SlowModeEnabled and math.min(baseSpeed, cfg.SlowMoveSpeed) or baseSpeed
@@ -2935,7 +2997,7 @@ RunService.RenderStepped:Connect(function(dt)
 			end
 		end
 	end
-	if hum and hum.Health > 0 and char then
+	if hum and hum.Health > 0 and char and not cfg.FlyEnabled then
 		local hrp = char:FindFirstChild("HumanoidRootPart")
 		if hrp and hrp:IsA("BasePart") then
 			local extraG = cfg.PlayerGravity - Workspace.Gravity
@@ -3156,7 +3218,7 @@ RunService.RenderStepped:Connect(function(dt)
 		backlockFireAcc = 0
 	end
 
-	if cfg.SpiderEnabled and hum and hum.Health > 0 and char then
+	if cfg.SpiderEnabled and not cfg.FlyEnabled and hum and hum.Health > 0 and char then
 		local hrp = char:FindFirstChild("HumanoidRootPart")
 		if hrp and hrp:IsA("BasePart") then
 			local forwardPressed = moveKeys.W or UserInputService:IsKeyDown(Enum.KeyCode.W)
@@ -3183,7 +3245,7 @@ RunService.RenderStepped:Connect(function(dt)
 		end
 	end
 
-	if cfg.BhopEnabled and spaceDown then
+	if cfg.BhopEnabled and not cfg.FlyEnabled and spaceDown then
 		if hum and hum.Health > 0 and (hum.FloorMaterial ~= Enum.Material.Air) then
 			-- keep bhop jump height sane (do not amplify with custom jump power)
 			local oldJP = hum.JumpPower
@@ -3193,7 +3255,7 @@ RunService.RenderStepped:Connect(function(dt)
 		end
 	end
 
-	if cfg.NoClipEnabled then
+	if cfg.NoClipEnabled or cfg.FlyEnabled then
 		noclipTickAcc += dt
 		if noclipTickAcc >= 0.12 then
 			noclipTickAcc = 0
@@ -3256,6 +3318,7 @@ local function applyPanicModeState(v: boolean)
 	cfg.AutoUnstuckEnabled = false
 	cfg.WeaponProfilesEnabled = false
 	cfg.VerticalFreezeEnabled = false
+	cfg.FlyEnabled = false
 	cfg.TiltEnabled = false
 	cfg.BananaDriftEnabled = false
 	cfg.FakeLagPuppetEnabled = false
@@ -3685,6 +3748,9 @@ local function bootAetherMenuApi()
 	slider("PlayerGravity", move, "Player gravity", 0, 500, 1)
 	bool("VerticalFreezeEnabled", move, "Vertical freeze", function(v) if not v then verticalFreezeY = nil end end)
 	move:Section("Traversal mechanics")
+	bool("FlyEnabled", move, "Camera-direction fly", function(v) if not v then Motion.stopFly() end end)
+	slider("FlySpeed", move, "Fly speed", 10, 300, 5)
+	slider("FlyAcceleration", move, "Fly acceleration", 1, 30, 1)
 	bool("GrappleEnabled", move, "Grappling hook", function(v) if not v then Motion.stopGrapple() end end)
 	window:AddButton(move, {
 		id = "GrappleAction",
